@@ -1,0 +1,346 @@
+import logging
+import numpy as np
+from scipy.ndimage import distance_transform_edt
+
+logger = logging.getLogger(__name__)
+from uav_3d.simulator.core import Simulator
+from itertools import product
+
+from uav_3d.utils.grid_map import GridMapWithDistance
+
+class DWAPlanner(Simulator):
+    def __init__(self, config, heading_weight: float = 2, obstacle_weight: float = 1,
+            velocity_weight: float = 1, predict_time: float = 10, x_resolution: float = 0.05,
+            y_resolution : float = 0.05, z_resolution: float = 0.05, grid_resolution = 1, **params):
+        # 初始化 UAV 状态，最大速度
+        super().__init__(config)
+        self.heading_weight = heading_weight
+        self.obstacle_weight = obstacle_weight
+        self.velocity_weight = velocity_weight
+        self.history_pose = []
+        
+        self.predict_time = predict_time
+        #for dwa velocity planning
+        self.x_resolution = x_resolution
+        self.y_resolution = y_resolution
+        self.z_resolution = z_resolution
+
+        #for grid map
+        self.grid_resolution = grid_resolution
+
+        self.params = {}
+        self.params["MAX_ITERATION"] = params["MAX_ITERATION"] if "MAX_ITERATION" in params.keys() else 300
+
+        self.params["LOOKAHEAD_TIME"] = params["LOOKAHEAD_TIME"] if "LOOKAHEAD_TIME" in params.keys() else 10
+        self.params["MAX_LOOKAHEAD_DIST"] = params["MAX_LOOKAHEAD_DIST"] if "MAX_LOOKAHEAD_DIST" in params.keys() else 10
+        self.params["MIN_LOOKAHEAD_DIST"] = params["MIN_LOOKAHEAD_DIST"] if "MIN_LOOKAHEAD_DIST" in params.keys() else 5
+        self.params["TIME_STEP"] = params["TIME_STEP"] if "TIME_STEP" in params.keys() else 1
+        
+        self.params["MAX_V_X_INC"] = params["MAX_V_X_INC"] if "MAX_V_X_INC" in params.keys() else 0.2
+        self.params["MAX_V_Y_INC"] = params["MAX_V_Y_INC"] if "MAX_V_Y_INC" in params.keys() else 0.2
+        self.params["MAX_V_Z_INC"] = params["MAX_V_Z_INC"] if "MAX_V_Z_INC" in params.keys() else 0.2
+
+        self.params["MAX_V_X_DEC"] = params["MAX_V_X_DEC"] if "MAX_V_X_DEC" in params.keys() else 0.2
+        self.params["MAX_V_Y_DEC"] = params["MAX_V_Y_DEC"] if "MAX_V_Y_DEC" in params.keys() else 0.2
+        self.params["MAX_V_Z_DEC"] = params["MAX_V_Z_DEC"] if "MAX_V_Z_DEC" in params.keys() else 0.2
+        
+        self.params["MAX_X"] = params["MAX_X"] if "MAX_X" in params.keys() else 0.4
+        self.params["MAX_Y"] = params["MAX_Y"] if "MAX_Y" in params.keys() else 0.4
+        self.params["MAX_Z"] = params["MAX_Z"] if "MAX_Z" in params.keys() else 0.4
+
+        self.params["MIN_X"] = params["MIN_X"] if "MIN_X" in params.keys() else -0.4
+        self.params["MIN_Y"] = params["MIN_Y"] if "MIN_Y" in params.keys() else -0.4
+        self.params["MIN_Z"] = params["MIN_Z"] if "MIN_Z" in params.keys() else -0.4
+
+        self.params["GOAL_TOLERANCE"] = params["GOAL_TOLERANCE"] if "GOAL_TOLERANCE" in params.keys() else 0.5
+        self.params["OUTOFBOUNDARY_TOLERANCE"] = params["OUTOFBOUNDARY_TOLERANCE"] if "OUTOFBOUNDARY_TOLERANCE" in params.keys() else 3
+    def reset(self, options: dict = None):
+        """Reset the simulation environment."""
+        options = options or {}
+        self.time_step = 0
+        self.collision = False
+        self.reach_goal = False
+        self.out_of_bound = False
+        self.state_snapshot = None
+
+        fix_scenario = options.get("fix_scenario", False)
+        fix_task = options.get("fix_task", False)
+        custom_scenario = options.get("custom_scenario", None)
+
+        if custom_scenario:
+            self.load_custom_scenario(custom_scenario)
+        else:
+            if not self.buildings or not fix_scenario:
+                scenario = self.scene.generate_scenario()
+            else:
+                scenario = self.scene.fix_scenario()
+                scenario["buildings"] = self.buildings
+
+            if fix_task and self.uav_position is not None:
+                scenario["uav_position"] = self.trajectory[0]
+                scenario["goal_position"] = self.goal_position
+            else:
+                scenario["uav_position"] = scenario["uav"]["position"]
+                scenario["goal_position"] = scenario["goal"]["position"]
+
+            self.uav_position = scenario["uav_position"]
+            self.uav_position_dwa = scenario["uav_position"].copy()
+            self.goal_position = scenario["goal_position"]
+
+        if self.planner:
+            g_path = self.planner.plan(self.uav_position, self.goal_position)
+            if not g_path:
+                # If no path is found, re-run the scenario generation
+                logger.info("Planner failed to find a path. Re-generating scenario.")
+                return self.reset(options)
+
+        # Reset UAV velocity and orientation
+        self.uav_velocity = np.array([0, 0, 0])
+        delta = self.goal_position - self.uav_position
+        self.uav_rotation = self._compute_orientation(*delta)
+        self.trajectory = [self.uav_position.copy()]
+        self.origin = (0, 0, 0)
+        self.grid = self.get_global_grid()
+        self.grid_map = GridMapWithDistance(self.grid, self.grid_resolution, self.origin)
+        
+    @property
+    def lookahead_dist(self):
+        composited_speed = np.linalg.norm(self.uav_velocity)
+        x = composited_speed * self.params["LOOKAHEAD_TIME"]
+        return max(self.params["MIN_LOOKAHEAD_DIST"], min(x, self.params["MAX_LOOKAHEAD_DIST"]))
+
+    def dist(self, start: np.ndarray, end: np.ndarray) -> float:
+        return np.linalg.norm(np.array(start) - np.array(end))
+    
+    def reachGoal(self, start: np.ndarray, end: np.ndarray) -> bool:
+        return self.dist(start, end) <= self.params["GOAL_TOLERANCE"]
+
+    def plan(self):
+        # self.history_pose.append(self.uav_position)
+        for _ in range(self.params["MAX_ITERATION"]):
+
+        # for _ in range(20):
+            # break until goal reached
+            if self.reachGoal(self.uav_position_dwa, self.goal_position):
+                return self.history_pose
+            
+            # get the particular point on the path at the lookahead distance to track
+            lookahead_pt = self.getLookaheadPoint()
+
+            # dynamic configure
+            vr = self.calDynamicWin()
+            eval_win, traj_win = self.evaluation(vr, lookahead_pt)
+            
+            # failed
+            if not len(eval_win):
+                break
+
+            # update
+            max_index = np.argmax(eval_win[:, -1])
+            u = np.expand_dims(eval_win[max_index, 0:-1], axis=1)
+
+            self.kinematic(u, self.params["TIME_STEP"])
+            self.history_pose.append(self.uav_position_dwa.copy())
+            self.update_dynamic_obstacles()
+            self.grid = self.get_global_grid()
+            self.grid_map = GridMapWithDistance(self.grid, self.grid_resolution, self.origin)
+            
+        print(f"time:{_}")
+        return self.history_pose
+    
+    
+    def kinematic(self, u: np.ndarray, dt: float):
+        # u = np.array([[vx], [vy], [vz]])
+        self.uav_position_dwa[0] += u[0, 0] * dt
+        self.uav_position_dwa[1] += u[1, 0] * dt
+        self.uav_position_dwa[2] += u[2, 0] * dt
+        self.uav_velocity = u.squeeze()
+        # print(u)
+        # print(self.uav_position, u)
+
+    def line_circle_Intersection(self, point_a: np.ndarray, point_b: np.ndarray,
+                                 center: np.ndarray, radius: float) -> np.ndarray:
+        d = point_b - point_a
+        A = np.dot(d, d)
+        B = 2 * np.dot(d, point_a - center)
+        C = np.dot(point_a - center, point_a - center) - radius**2
+
+        discriminant = B**2 - 4 * A * C
+
+        if discriminant < 0:
+            return point_b  
+        
+        sqrt_discriminant = np.sqrt(discriminant)
+        t1 = (-B - sqrt_discriminant) / (2 * A)
+        t2 = (-B + sqrt_discriminant) / (2 * A)
+
+        # Check if t1 and t2 are within [0, 1]
+        intersections = []
+        if 0 <= t1 <= 1:
+            intersections.append(point_a + t1 * d)
+        if 0 <= t2 <= 1:
+            intersections.append(point_a + t2 * d)
+
+        return intersections[0] if len(intersections) == 1 else point_b
+
+    def getLookaheadPoint(self) -> np.ndarray:
+        if self.planner.path is None:
+            assert RuntimeError("Please plan the path using g_planner!")
+
+        dist_to_uav = [self.dist(p, self.uav_position_dwa) for p in self.planner.path + [self.goal_position]]
+        idx_closest = dist_to_uav.index(min(dist_to_uav))
+        idx_goal = len(self.planner.path) - 1
+        # idx_prev = idx_goal - 1
+        for i in range(idx_closest, len(self.planner.path)):
+            if self.dist(self.planner.path[i], self.uav_position_dwa) >= self.lookahead_dist:
+                idx_goal = i
+                break
+        # print("getLookaheadPoint:", self.planner.path[idx_goal])
+        if idx_goal == len(self.planner.path) - 1:
+            return self.planner.path[idx_goal]
+        else:
+            idx_prev = idx_goal - 1
+            return self.line_circle_Intersection(self.planner.path[idx_prev], self.planner.path[idx_goal],
+                                         self.uav_position_dwa, self.lookahead_dist)
+    
+    def calDynamicWin(self):
+        vs = (self.params["MIN_X"], self.params["MAX_X"],
+              self.params["MIN_Y"], self.params["MAX_Y"],
+              self.params["MIN_Z"], self.params["MAX_Z"])
+
+        vd = (self.uav_velocity[0] - self.params["MAX_V_X_DEC"] * self.params["TIME_STEP"],
+              self.uav_velocity[0] + self.params["MAX_V_X_INC"] * self.params["TIME_STEP"],
+              self.uav_velocity[1] - self.params["MAX_V_Y_DEC"] * self.params["TIME_STEP"],
+              self.uav_velocity[1] + self.params["MAX_V_Y_INC"] * self.params["TIME_STEP"],
+              self.uav_velocity[2] - self.params["MAX_V_Z_DEC"] * self.params["TIME_STEP"],
+              self.uav_velocity[2] + self.params["MAX_V_Z_INC"] * self.params["TIME_STEP"])
+        
+        v_tmp = np.array([vs, vd])
+        vr = [
+            float(np.max(v_tmp[:, 0])),  float(np.min(v_tmp[:, 1])),  
+            float(np.max(v_tmp[:, 2])),  float(np.min(v_tmp[:, 3])),  
+            float(np.max(v_tmp[:, 4])),  float(np.min(v_tmp[:, 5]))   
+        ]
+
+        # print("calDynamicWin:", vr)
+        return vr
+    
+    def headingEvaluation(self, end_pt, lookahead_pt):
+        #距离差向量和速度向量的余弦相似度，取值-1至1
+        x, y, z, vx, vy, vz = end_pt
+        x_l, y_l, z_l = lookahead_pt
+        # print(end_pt, lookahead_pt)
+        distance_vector = np.array([x_l - x, y_l - y, z_l - z]).flatten()
+        velocity_vector = np.array([vx, vy, vz]).flatten()
+        # print(distance_vector, velocity_vector)
+        distance_norm = np.linalg.norm(distance_vector)
+        velocity_norm = np.linalg.norm(velocity_vector)
+        # print(distance_norm, velocity_norm)
+        if distance_norm == 0 or velocity_norm == 0:
+            return 0
+        
+        cosine_similarity = np.dot(distance_vector, velocity_vector) / (distance_norm * velocity_norm)
+        # print("cosine_similarity:",cosine_similarity)
+        return cosine_similarity
+    
+    def obstacleEvaluation(self, traj: np.ndarray = None):
+        distances = []
+        for point in traj:
+            if (point[0] < 0 or point[0] >= self.map_size[0] 
+                or point[1] < 0 or point[1] >= self.map_size[1] 
+                or point[2] < 0 or point[2] >= self.map_size[2]):
+                distances.append(self.params["OUTOFBOUNDARY_TOLERANCE"])
+            else:
+                distances.append(self.grid_map.get_distance_to_obstacle(point))
+        min_distance = min(distances)
+        # print(f"{min_distance:.2f} meters away from the nearest obstacle.")
+        return min_distance
+
+    def evaluation(self, vr, lookahead_pt: np.ndarray):
+        '''
+        lookahead_pt: (x, y, z)
+        '''
+        eval_win = []
+        traj_win = []
+        vx_min, vx_max, vy_min, vy_max, vz_min, vz_max = vr
+                
+        num_x = max(1, int((vx_max - vx_min) / self.x_resolution))
+        num_y = max(1, int((vy_max - vy_min) / self.y_resolution))
+        num_z = max(1, int((vz_max - vz_min) / self.z_resolution))
+
+        v_x = np.linspace(vx_min, vx_max, num=num_x).tolist()
+        v_y = np.linspace(vy_min, vy_max, num=num_y).tolist()
+        v_z = np.linspace(vz_min, vz_max, num=num_z).tolist()
+        
+        for vx, vy, vz in product(v_x, v_y, v_z):
+            traj = self.calTrajectory(vx, vy, vz)
+            end_pt = traj[-1].squeeze().tolist()
+
+            #heading evaluation
+            heading = self.headingEvaluation(end_pt, lookahead_pt)
+            # print("end_pt:", end_pt, "lookahead_pt:", lookahead_pt, "heading:", heading)
+
+            #velocity evaluation
+            velocity = np.sqrt(vx**2 + vy**2 + vz**2)
+
+            #obstacle evaluation    
+            obstacle = self.obstacleEvaluation(traj[:, :3])
+
+            # eval_win.append((vx, vy, vz, heading, velocity))
+            eval_win.append((vx, vy, vz, heading, velocity, obstacle))
+            traj_win.append(traj)
+        if len(eval_win) == 0:
+            print("eval_win is empty. No valid trajectories found.")
+
+        eval_win = np.array(eval_win)
+        
+
+        # if np.sum(eval_win[:, 2]) != 0:
+        #     eval_win[:, 2] = eval_win[:, 2] / np.sum(eval_win[:, 2])
+        # if np.sum(eval_win[:, 3]) != 0:
+        #     eval_win[:, 3] = eval_win[:, 3] / np.sum(eval_win[:, 3])
+        # if np.sum(eval_win[:, 5]) != 0:
+        #     eval_win[:, 5] = eval_win[:, 5] / np.sum(eval_win[:, 5])
+
+        # evaluation
+        factor = np.array([[1, 0, 0,                    0],
+                           [0, 1, 0,                    0],
+                           [0, 0, 1,                    0],
+                           [0, 0, 0,  self.heading_weight],
+                           [0, 0, 0,  self.velocity_weight],
+                           [0, 0, 0,  self.obstacle_weight]])
+        
+        return eval_win @ factor, traj_win
+
+    @property
+    def uav_state(self) -> None:
+        """
+        Get the state.
+        """
+        state = np.array([[self.uav_position_dwa[0]], [self.uav_position_dwa[1]], [self.uav_position_dwa[2]],
+                          [self.uav_velocity[0]], [self.uav_velocity[1]], [self.uav_velocity[2]]])
+        return state
+
+    def calTrajectory(self, vx, vy, vz):
+        #输出1 * 6，3个位置，3个速度
+        u = np.array([[vx], [vy], [vz]])
+        uav_state = self.uav_state
+        time_steps = int(self.predict_time / self.params["TIME_STEP"])
+        traj = []
+
+        for i in range(time_steps):
+            uav_state = self.lookforward(uav_state, u, self.params["TIME_STEP"])
+            traj.append(uav_state)
+
+        return np.array(traj).squeeze()
+
+    def lookforward(self, uav_state, u, dt):
+        x, y, z, vx, vy, vz = uav_state
+
+        vx_new, vy_new, vz_new = u.flatten()  
+        x_next = x + vx_new * dt
+        y_next = y + vy_new * dt
+        z_next = z + vz_new * dt
+        next_state = np.array([x_next, y_next, z_next, vx_new, vy_new, vz_new])
+
+        return next_state
